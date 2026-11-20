@@ -11,6 +11,7 @@ Performance work on the extract/build/update pipeline. All of these preserve gra
 - Perf: **extract** each source file is read from disk once (the key hash and the parse share one buffer) instead of twice on a cold build, and the tree-sitter `Parser` is reused per language within a worker instead of rebuilt per file (file reads roughly halved on the worker path).
 - Perf: **extract** the cross-file resolution finalize builds its shared node/edge indexes in a few fused passes instead of ~6 independent full scans of the graph; ~15% faster on the finalize stage.
 - Perf: **watch** the no-change topology comparison uses an order-independent content hash computed in one pass instead of sorting and re-serializing the whole graph; ~1.4x on that compare.
+- Feature: **serve** the MCP tool handlers now live at module level (`serve.TOOL_HANDLERS`, each taking a `GraphContext` and the tool arguments), and the new public `graphify.query_api` module (`GraphCache`, `load`, `run_tool`, `GRAPH_TOOLS`, `PR_TOOLS`) runs them in-process. Another MCP host, such as a multi-project gateway, can then serve graphify's tools without spawning `graphify.serve` or importing private helpers. `graphify.serve` behaves exactly as before.
 - Perf: **cluster** the community partition is cached by a topology hash and reused when the graph is unchanged (~9x on a cluster cache hit), and the deterministic edge-sort key drops a per-edge `json.dumps` in favour of a cheap tuple key (identical ordering).
 
 ## 0.9.113 (2026-11-19)

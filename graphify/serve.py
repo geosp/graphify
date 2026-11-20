@@ -8,6 +8,7 @@ import sys
 import warnings
 from array import array
 from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
 import threading
 from typing import NamedTuple
@@ -2892,6 +2893,311 @@ def _neighbor_lines(G: nx.Graph, nid: str, rel_filter: str = "") -> list[str]:
     return lines
 
 
+@dataclass(frozen=True)
+class GraphContext:
+    """One loaded graph as the tool handlers see it."""
+
+    G: nx.Graph
+    communities: dict[int, list[str]]
+    graph_path: str
+
+
+# ---------------------------------------------------------------------------
+# MCP tool handlers. Each takes the graph context and the tool arguments and
+# returns text. They live at module level (not inside _build_server) so other
+# hosts can reuse them through graphify.query_api.
+# ---------------------------------------------------------------------------
+
+def _tool_query_graph(ctx: GraphContext, arguments: dict) -> str:
+    G, communities, active_graph_path = ctx.G, ctx.communities, ctx.graph_path
+    import time as _time
+    from graphify import querylog
+    question = arguments["question"]
+    mode = arguments.get("mode", "bfs")
+    depth = min(int(arguments.get("depth", 3)), 6)
+    budget = int(arguments.get("token_budget", 2000))
+    context_filter = arguments.get("context_filter")
+    demote_docs = arguments.get("demote_docs", True)
+    if isinstance(demote_docs, str):
+        demote_docs = demote_docs.lower() not in ("false", "0", "no")
+    _t0 = _time.perf_counter()
+    result = _query_graph_text(
+        G,
+        question,
+        mode=mode,
+        depth=depth,
+        token_budget=budget,
+        context_filters=context_filter,
+        graph_path=str(active_graph_path),
+        demote_docs=demote_docs,
+    )
+    querylog.log_query(
+        kind="mcp_query",
+        question=question,
+        corpus=str(active_graph_path),
+        result=result,
+        mode=mode,
+        depth=depth,
+        token_budget=budget,
+        duration_ms=(_time.perf_counter() - _t0) * 1000,
+    )
+    return result
+
+def _tool_get_node(ctx: GraphContext, arguments: dict) -> str:
+    G, communities, active_graph_path = ctx.G, ctx.communities, ctx.graph_path
+    from graphify.sections import is_section_node as _is_section_node
+
+    raw = _node_arg(arguments)
+    if not raw:
+        return "Provide a node label or id (accepted keys: label, node_id, id)."
+    label = raw
+    nid, err = _resolve_single_node(G, label)
+    if err:
+        return err
+    d = G.nodes[nid]
+    attrs = d.get("attributes")
+    attrs_line = []
+    if isinstance(attrs, dict) and attrs:
+        raw_attrs = json.dumps(attrs, sort_keys=True)
+        if len(raw_attrs) > 1000:
+            raw_attrs = raw_attrs[:997] + "..."
+        attrs_line = [f"  Attributes: {_CONTROL_CHAR_RE.sub('', raw_attrs)}"]
+    # Sanitise every LLM-derived field before concatenation (F-010).
+    return "\n".join([
+        f"Node: {sanitize_label(d.get('label', nid))}",
+        f"  ID: {sanitize_label(nid)}",
+        f"  Source: {sanitize_label(str(d.get('source_file', '')))} {sanitize_label(str(d.get('source_location', '')))}",
+        # A C/C++/ObjC symbol declared in a header and defined in the sibling
+        # impl file is ONE node keyed to the header, so Source alone points at
+        # the declaration. Name where it is implemented too, when known.
+        *([f"  Defined in: {sanitize_label(str(d.get('definition_file', '')))} "
+           f"{sanitize_label(str(d.get('definition_location', '')))}"]
+          if d.get("definition_file") else []),
+        *(["  Section: get_section returns this Markdown section's text"]
+          if _is_section_node(d) else []),
+        f"  Type: {sanitize_label(str(d.get('file_type', '')))}",
+        f"  Community: {sanitize_label(str(d.get('community_name') or d.get('community', '')))}",
+        f"  Degree: {G.degree(nid)}",
+        *attrs_line,
+    ])
+
+def _tool_get_section(ctx: GraphContext, arguments: dict) -> str:
+    G, communities, active_graph_path = ctx.G, ctx.communities, ctx.graph_path
+    from graphify.sections import (
+        DEFAULT_MAX_CHARS,
+        format_section,
+        read_section,
+        resolve_section_query,
+        section_root,
+    )
+
+    raw = _node_arg(arguments)
+    if not raw:
+        return "Provide a node label or id (accepted keys: label, node_id, id)."
+    nid, err = resolve_section_query(G, raw)
+    if nid is None:
+        return err
+    d = G.nodes[nid]
+    max_chars = max(1, int(arguments.get("max_chars", DEFAULT_MAX_CHARS)))
+    section, reason = read_section(d, section_root(Path(active_graph_path)), max_chars)
+    if section is None:
+        return sanitize_label(reason)
+    return format_section(section, sanitize_label(d.get("label", nid)))
+
+def _tool_get_neighbors(ctx: GraphContext, arguments: dict) -> str:
+    G, communities, active_graph_path = ctx.G, ctx.communities, ctx.graph_path
+    raw = _node_arg(arguments)
+    if not raw:
+        return "Provide a node label or id (accepted keys: label, node_id, id)."
+    label = raw
+    rel_filter = arguments.get("relation_filter", "").lower()
+    nid, err = _resolve_single_node(G, label)
+    if err:
+        return err
+    lines = [f"Neighbors of {sanitize_label(G.nodes[nid].get('label', nid))}:"]
+    lines.extend(_neighbor_lines(G, nid, rel_filter))
+    budget = int(arguments.get("token_budget", 2000))
+    return _cut_lines_to_budget(
+        lines, budget, "Narrow with relation_filter or use get_node for a specific symbol"
+    )
+
+def _tool_get_community(ctx: GraphContext, arguments: dict) -> str:
+    G, communities, active_graph_path = ctx.G, ctx.communities, ctx.graph_path
+    cid = int(arguments["community_id"])
+    nodes = communities.get(cid, [])
+    if not nodes:
+        return f"Community {cid} not found."
+    header = _community_header(cid, G.nodes[nodes[0]].get("community_name"))
+    lines = [f"{header} ({len(nodes)} nodes):"]
+    for n in nodes:
+        d = G.nodes[n]
+        # Sanitise label and source_file (F-010).
+        lines.append(
+            f"  {sanitize_label(d.get('label', n))} "
+            f"[{sanitize_label(str(d.get('source_file', '')))}]"
+        )
+    budget = int(arguments.get("token_budget", 2000))
+    return _cut_lines_to_budget(
+        lines, budget, "Raise token_budget or use get_node for specific members"
+    )
+
+def _tool_god_nodes(ctx: GraphContext, arguments: dict) -> str:
+    G, communities, active_graph_path = ctx.G, ctx.communities, ctx.graph_path
+    from graphify.analyze import god_nodes as _god_nodes
+    _pct = arguments.get("exclude_hubs_percentile")
+    nodes = _god_nodes(
+        G, top_n=int(arguments.get("top_n", 10)),
+        exclude_hubs_percentile=float(_pct) if _pct is not None else None,
+    )
+    lines = ["God nodes (most connected):"]
+    lines += [f"  {i}. {n['label']} - {n['degree']} edges" for i, n in enumerate(nodes, 1)]
+    return "\n".join(lines)
+
+def _tool_graph_stats(ctx: GraphContext, _: dict) -> str:
+    G, communities, active_graph_path = ctx.G, ctx.communities, ctx.graph_path
+    confs = [d.get("confidence", "EXTRACTED") for _, _, d in G.edges(data=True)]
+    total = len(confs) or 1
+    return (
+        f"Nodes: {G.number_of_nodes()}\n"
+        f"Edges: {G.number_of_edges()}\n"
+        f"Communities: {len(communities)}\n"
+        f"EXTRACTED: {round(confs.count('EXTRACTED')/total*100)}%\n"
+        f"INFERRED: {round(confs.count('INFERRED')/total*100)}%\n"
+        f"AMBIGUOUS: {round(confs.count('AMBIGUOUS')/total*100)}%\n"
+        f"{_build_commit_line(ctx)}"
+    )
+
+def _build_commit_line(ctx: GraphContext) -> str:
+    """Which commit the graph was built from, and whether HEAD has moved on.
+
+    An MCP client cannot stat graph.json, so this is its only staleness
+    signal (#3354). HEAD is read at query time from the repo holding the
+    graph (the same anchor export.to_json stamps from); no git or no repo
+    just drops the HEAD comparison. Empty when the graph has no commit.
+    """
+    G, active_graph_path = ctx.G, ctx.graph_path
+    commit = getattr(G, "graph", {}).get("_built_at_commit")
+    if not commit:
+        return ""
+    from graphify.export import _git_head
+    head = _git_head(Path(active_graph_path).parent)
+    if not head:
+        return f"Built at commit: {commit}\n"
+    if head == commit:
+        return f"Built at commit: {commit} (matches HEAD)\n"
+    return (
+        f"Built at commit: {commit}\n"
+        f"HEAD is {head[:7]}, graph built at {commit[:7]}: graph may be stale\n"
+    )
+
+def _tool_shortest_path(ctx: GraphContext, arguments: dict) -> str:
+    G, communities, active_graph_path = ctx.G, ctx.communities, ctx.graph_path
+    return _shortest_path_text(G, arguments)
+
+def _tool_list_prs(ctx: GraphContext, arguments: dict) -> str:
+    G, communities, active_graph_path = ctx.G, ctx.communities, ctx.graph_path
+    from graphify.prs import fetch_prs, fetch_worktrees, format_prs_text, _detect_default_branch
+    repo = arguments.get("repo") or None
+    base = arguments.get("base") or _detect_default_branch(repo)
+    try:
+        prs = fetch_prs(repo=repo, base=base)
+    except RuntimeError as e:
+        raise ToolError(f"Error: {e}") from e
+    worktrees = fetch_worktrees()
+    for pr in prs:
+        pr.worktree_path = worktrees.get(pr.branch)
+    return format_prs_text(prs, base)
+
+def _tool_get_pr_impact(ctx: GraphContext, arguments: dict) -> str:
+    G, communities, active_graph_path = ctx.G, ctx.communities, ctx.graph_path
+    from graphify.prs import fetch_pr_files, compute_pr_impact, _gh, _parse_ci
+    number = int(arguments["pr_number"])
+    repo = arguments.get("repo") or None
+    # Use gh pr view directly — works for any base branch, not just the default
+    view_args = ["pr", "view", str(number), "--json",
+                 "title,headRefName,baseRefName,author,isDraft,reviewDecision,statusCheckRollup,updatedAt"]
+    if repo:
+        view_args += ["--repo", repo]
+    pr_data = _gh(*view_args)
+    if pr_data is None:
+        raise ToolError(f"PR #{number} not found or gh not authenticated.")
+    files = fetch_pr_files(number, repo)
+    if not files:
+        return f"PR #{number}: no changed files found (may require gh auth)."
+    comms, nodes = compute_pr_impact(files, G)
+    ci = _parse_ci(pr_data.get("statusCheckRollup") or [])
+    lines = [
+        f"PR #{number}: {pr_data['title']}",
+        f"CI: {ci}  Review: {pr_data.get('reviewDecision') or 'none'}",
+        f"Base: {pr_data['baseRefName']}  Author: {(pr_data.get('author') or {}).get('login', '?')}",
+        f"\nGraph impact: {nodes} nodes across {len(comms)} communities",
+        f"Communities touched: {comms}",
+        f"Files changed ({len(files)}):",
+    ]
+    lines += [f"  {f}" for f in files[:20]]
+    if len(files) > 20:
+        lines.append(f"  … and {len(files) - 20} more")
+    return "\n".join(lines)
+
+def _tool_triage_prs(ctx: GraphContext, arguments: dict) -> str:
+    G, communities, active_graph_path = ctx.G, ctx.communities, ctx.graph_path
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from graphify.prs import fetch_prs, fetch_worktrees, fetch_pr_files, compute_pr_impact, _STATUS_ORDER, _detect_default_branch
+    repo = arguments.get("repo") or None
+    base = arguments.get("base") or _detect_default_branch(repo)
+    try:
+        prs = fetch_prs(repo=repo, base=base)
+    except RuntimeError as e:
+        raise ToolError(f"Error: {e}") from e
+    worktrees = fetch_worktrees()
+    for pr in prs:
+        pr.worktree_path = worktrees.get(pr.branch)
+    actionable = [p for p in prs if p.base_branch == base and p.status not in ("WRONG-BASE", "STALE")]
+    if not actionable:
+        return f"No actionable PRs targeting {base}."
+    # Fetch diffs concurrently then compute graph impact using in-memory G
+    workers = min(8, len(actionable))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        future_to_pr = {pool.submit(fetch_pr_files, pr.number, repo): pr for pr in actionable}
+        for fut in as_completed(future_to_pr):
+            pr = future_to_pr[fut]
+            try:
+                files = fut.result()
+            except Exception:
+                files = []
+            if files:
+                pr.files_changed = files
+                pr.communities_touched, pr.nodes_affected = compute_pr_impact(files, G)
+    header = (
+        f"Actionable PRs targeting {base}: {len(actionable)}\n"
+        "Rank these by review priority. Higher blast_radius = more graph communities affected = higher merge risk.\n"
+    )
+    lines = [header]
+    for p in sorted(actionable, key=lambda x: (_STATUS_ORDER.index(x.status) if x.status in _STATUS_ORDER else 99)):
+        impact = f"  blast_radius={p.blast_radius}" if p.blast_radius else ""
+        wt = f"  worktree={p.worktree_path}" if p.worktree_path else ""
+        lines.append(
+            f"PR #{p.number} [{p.status}] CI={p.ci_status} review={p.review_decision or 'none'} "
+            f"age={p.days_old}d author={p.author}{impact}{wt}\n  title: {p.title}"
+        )
+    return "\n\n".join(lines)
+
+
+TOOL_HANDLERS: dict = {
+    "query_graph": _tool_query_graph,
+    "get_node": _tool_get_node,
+    "get_section": _tool_get_section,
+    "get_neighbors": _tool_get_neighbors,
+    "get_community": _tool_get_community,
+    "god_nodes": _tool_god_nodes,
+    "graph_stats": _tool_graph_stats,
+    "shortest_path": _tool_shortest_path,
+    "list_prs": _tool_list_prs,
+    "get_pr_impact": _tool_get_pr_impact,
+    "triage_prs": _tool_triage_prs,
+}
+
+
 def _build_server(graph_path: str):
     """Build the configured low-level MCP Server (shared by every transport).
 
@@ -3146,281 +3452,10 @@ def _build_server(graph_path: str):
             }
         return _tools
 
-    def _tool_query_graph(arguments: dict) -> str:
-        import time as _time
-        from graphify import querylog
-        question = arguments["question"]
-        mode = arguments.get("mode", "bfs")
-        depth = min(int(arguments.get("depth", 3)), 6)
-        budget = int(arguments.get("token_budget", 2000))
-        context_filter = arguments.get("context_filter")
-        demote_docs = arguments.get("demote_docs", True)
-        if isinstance(demote_docs, str):
-            demote_docs = demote_docs.lower() not in ("false", "0", "no")
-        _t0 = _time.perf_counter()
-        result = _query_graph_text(
-            G,
-            question,
-            mode=mode,
-            depth=depth,
-            token_budget=budget,
-            context_filters=context_filter,
-            graph_path=str(active_graph_path),
-            demote_docs=demote_docs,
-        )
-        querylog.log_query(
-            kind="mcp_query",
-            question=question,
-            corpus=str(active_graph_path),
-            result=result,
-            mode=mode,
-            depth=depth,
-            token_budget=budget,
-            duration_ms=(_time.perf_counter() - _t0) * 1000,
-        )
-        return result
+    def _ctx() -> GraphContext:
+        return GraphContext(G, communities, str(active_graph_path))
 
-    def _tool_get_node(arguments: dict) -> str:
-        from graphify.sections import is_section_node as _is_section_node
-
-        raw = _node_arg(arguments)
-        if not raw:
-            return "Provide a node label or id (accepted keys: label, node_id, id)."
-        label = raw
-        nid, err = _resolve_single_node(G, label)
-        if err:
-            return err
-        d = G.nodes[nid]
-        attrs = d.get("attributes")
-        attrs_line = []
-        if isinstance(attrs, dict) and attrs:
-            raw_attrs = json.dumps(attrs, sort_keys=True)
-            if len(raw_attrs) > 1000:
-                raw_attrs = raw_attrs[:997] + "..."
-            attrs_line = [f"  Attributes: {_CONTROL_CHAR_RE.sub('', raw_attrs)}"]
-        # Sanitise every LLM-derived field before concatenation (F-010).
-        return "\n".join([
-            f"Node: {sanitize_label(d.get('label', nid))}",
-            f"  ID: {sanitize_label(nid)}",
-            f"  Source: {sanitize_label(str(d.get('source_file', '')))} {sanitize_label(str(d.get('source_location', '')))}",
-            # A C/C++/ObjC symbol declared in a header and defined in the sibling
-            # impl file is ONE node keyed to the header, so Source alone points at
-            # the declaration. Name where it is implemented too, when known.
-            *([f"  Defined in: {sanitize_label(str(d.get('definition_file', '')))} "
-               f"{sanitize_label(str(d.get('definition_location', '')))}"]
-              if d.get("definition_file") else []),
-            *(["  Section: get_section returns this Markdown section's text"]
-              if _is_section_node(d) else []),
-            f"  Type: {sanitize_label(str(d.get('file_type', '')))}",
-            f"  Community: {sanitize_label(str(d.get('community_name') or d.get('community', '')))}",
-            f"  Degree: {G.degree(nid)}",
-            *attrs_line,
-        ])
-
-    def _tool_get_section(arguments: dict) -> str:
-        from graphify.sections import (
-            DEFAULT_MAX_CHARS,
-            format_section,
-            read_section,
-            resolve_section_query,
-            section_root,
-        )
-
-        raw = _node_arg(arguments)
-        if not raw:
-            return "Provide a node label or id (accepted keys: label, node_id, id)."
-        nid, err = resolve_section_query(G, raw)
-        if nid is None:
-            return err
-        d = G.nodes[nid]
-        max_chars = max(1, int(arguments.get("max_chars", DEFAULT_MAX_CHARS)))
-        section, reason = read_section(d, section_root(Path(active_graph_path)), max_chars)
-        if section is None:
-            return sanitize_label(reason)
-        return format_section(section, sanitize_label(d.get("label", nid)))
-
-    def _tool_get_neighbors(arguments: dict) -> str:
-        raw = _node_arg(arguments)
-        if not raw:
-            return "Provide a node label or id (accepted keys: label, node_id, id)."
-        label = raw
-        rel_filter = arguments.get("relation_filter", "").lower()
-        nid, err = _resolve_single_node(G, label)
-        if err:
-            return err
-        lines = [f"Neighbors of {sanitize_label(G.nodes[nid].get('label', nid))}:"]
-        lines.extend(_neighbor_lines(G, nid, rel_filter))
-        budget = int(arguments.get("token_budget", 2000))
-        return _cut_lines_to_budget(
-            lines, budget, "Narrow with relation_filter or use get_node for a specific symbol"
-        )
-
-    def _tool_get_community(arguments: dict) -> str:
-        cid = int(arguments["community_id"])
-        nodes = communities.get(cid, [])
-        if not nodes:
-            return f"Community {cid} not found."
-        header = _community_header(cid, G.nodes[nodes[0]].get("community_name"))
-        lines = [f"{header} ({len(nodes)} nodes):"]
-        for n in nodes:
-            d = G.nodes[n]
-            # Sanitise label and source_file (F-010).
-            lines.append(
-                f"  {sanitize_label(d.get('label', n))} "
-                f"[{sanitize_label(str(d.get('source_file', '')))}]"
-            )
-        budget = int(arguments.get("token_budget", 2000))
-        return _cut_lines_to_budget(
-            lines, budget, "Raise token_budget or use get_node for specific members"
-        )
-
-    def _tool_god_nodes(arguments: dict) -> str:
-        from graphify.analyze import god_nodes as _god_nodes
-        _pct = arguments.get("exclude_hubs_percentile")
-        nodes = _god_nodes(
-            G, top_n=int(arguments.get("top_n", 10)),
-            exclude_hubs_percentile=float(_pct) if _pct is not None else None,
-        )
-        lines = ["God nodes (most connected):"]
-        lines += [f"  {i}. {n['label']} - {n['degree']} edges" for i, n in enumerate(nodes, 1)]
-        return "\n".join(lines)
-
-    def _tool_graph_stats(_: dict) -> str:
-        confs = [d.get("confidence", "EXTRACTED") for _, _, d in G.edges(data=True)]
-        total = len(confs) or 1
-        return (
-            f"Nodes: {G.number_of_nodes()}\n"
-            f"Edges: {G.number_of_edges()}\n"
-            f"Communities: {len(communities)}\n"
-            f"EXTRACTED: {round(confs.count('EXTRACTED')/total*100)}%\n"
-            f"INFERRED: {round(confs.count('INFERRED')/total*100)}%\n"
-            f"AMBIGUOUS: {round(confs.count('AMBIGUOUS')/total*100)}%\n"
-            f"{_build_commit_line()}"
-        )
-
-    def _build_commit_line() -> str:
-        """Which commit the graph was built from, and whether HEAD has moved on.
-
-        An MCP client cannot stat graph.json, so this is its only staleness
-        signal (#3354). HEAD is read at query time from the repo holding the
-        graph (the same anchor export.to_json stamps from); no git or no repo
-        just drops the HEAD comparison. Empty when the graph has no commit.
-        """
-        commit = getattr(G, "graph", {}).get("_built_at_commit")
-        if not commit:
-            return ""
-        from graphify.export import _git_head
-        head = _git_head(Path(active_graph_path).parent)
-        if not head:
-            return f"Built at commit: {commit}\n"
-        if head == commit:
-            return f"Built at commit: {commit} (matches HEAD)\n"
-        return (
-            f"Built at commit: {commit}\n"
-            f"HEAD is {head[:7]}, graph built at {commit[:7]}: graph may be stale\n"
-        )
-
-    def _tool_shortest_path(arguments: dict) -> str:
-        return _shortest_path_text(G, arguments)
-
-    def _tool_list_prs(arguments: dict) -> str:
-        from graphify.prs import fetch_prs, fetch_worktrees, format_prs_text, _detect_default_branch
-        repo = arguments.get("repo") or None
-        base = arguments.get("base") or _detect_default_branch(repo)
-        try:
-            prs = fetch_prs(repo=repo, base=base)
-        except RuntimeError as e:
-            raise ToolError(f"Error: {e}") from e
-        worktrees = fetch_worktrees()
-        for pr in prs:
-            pr.worktree_path = worktrees.get(pr.branch)
-        return format_prs_text(prs, base)
-
-    def _tool_get_pr_impact(arguments: dict) -> str:
-        from graphify.prs import fetch_pr_files, compute_pr_impact, _gh, _parse_ci
-        number = int(arguments["pr_number"])
-        repo = arguments.get("repo") or None
-        # Use gh pr view directly — works for any base branch, not just the default
-        view_args = ["pr", "view", str(number), "--json",
-                     "title,headRefName,baseRefName,author,isDraft,reviewDecision,statusCheckRollup,updatedAt"]
-        if repo:
-            view_args += ["--repo", repo]
-        pr_data = _gh(*view_args)
-        if pr_data is None:
-            raise ToolError(f"PR #{number} not found or gh not authenticated.")
-        files = fetch_pr_files(number, repo)
-        if not files:
-            return f"PR #{number}: no changed files found (may require gh auth)."
-        comms, nodes = compute_pr_impact(files, G)
-        ci = _parse_ci(pr_data.get("statusCheckRollup") or [])
-        lines = [
-            f"PR #{number}: {pr_data['title']}",
-            f"CI: {ci}  Review: {pr_data.get('reviewDecision') or 'none'}",
-            f"Base: {pr_data['baseRefName']}  Author: {(pr_data.get('author') or {}).get('login', '?')}",
-            f"\nGraph impact: {nodes} nodes across {len(comms)} communities",
-            f"Communities touched: {comms}",
-            f"Files changed ({len(files)}):",
-        ]
-        lines += [f"  {f}" for f in files[:20]]
-        if len(files) > 20:
-            lines.append(f"  … and {len(files) - 20} more")
-        return "\n".join(lines)
-
-    def _tool_triage_prs(arguments: dict) -> str:
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        from graphify.prs import fetch_prs, fetch_worktrees, fetch_pr_files, compute_pr_impact, _STATUS_ORDER, _detect_default_branch
-        repo = arguments.get("repo") or None
-        base = arguments.get("base") or _detect_default_branch(repo)
-        try:
-            prs = fetch_prs(repo=repo, base=base)
-        except RuntimeError as e:
-            raise ToolError(f"Error: {e}") from e
-        worktrees = fetch_worktrees()
-        for pr in prs:
-            pr.worktree_path = worktrees.get(pr.branch)
-        actionable = [p for p in prs if p.base_branch == base and p.status not in ("WRONG-BASE", "STALE")]
-        if not actionable:
-            return f"No actionable PRs targeting {base}."
-        # Fetch diffs concurrently then compute graph impact using in-memory G
-        workers = min(8, len(actionable))
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            future_to_pr = {pool.submit(fetch_pr_files, pr.number, repo): pr for pr in actionable}
-            for fut in as_completed(future_to_pr):
-                pr = future_to_pr[fut]
-                try:
-                    files = fut.result()
-                except Exception:
-                    files = []
-                if files:
-                    pr.files_changed = files
-                    pr.communities_touched, pr.nodes_affected = compute_pr_impact(files, G)
-        header = (
-            f"Actionable PRs targeting {base}: {len(actionable)}\n"
-            "Rank these by review priority. Higher blast_radius = more graph communities affected = higher merge risk.\n"
-        )
-        lines = [header]
-        for p in sorted(actionable, key=lambda x: (_STATUS_ORDER.index(x.status) if x.status in _STATUS_ORDER else 99)):
-            impact = f"  blast_radius={p.blast_radius}" if p.blast_radius else ""
-            wt = f"  worktree={p.worktree_path}" if p.worktree_path else ""
-            lines.append(
-                f"PR #{p.number} [{p.status}] CI={p.ci_status} review={p.review_decision or 'none'} "
-                f"age={p.days_old}d author={p.author}{impact}{wt}\n  title: {p.title}"
-            )
-        return "\n\n".join(lines)
-
-    _handlers = {
-        "query_graph": _tool_query_graph,
-        "get_node": _tool_get_node,
-        "get_section": _tool_get_section,
-        "get_neighbors": _tool_get_neighbors,
-        "get_community": _tool_get_community,
-        "god_nodes": _tool_god_nodes,
-        "graph_stats": _tool_graph_stats,
-        "shortest_path": _tool_shortest_path,
-        "list_prs": _tool_list_prs,
-        "get_pr_impact": _tool_get_pr_impact,
-        "triage_prs": _tool_triage_prs,
-    }
+    _handlers = TOOL_HANDLERS
 
     def _load_community_labels() -> dict[int, str]:
         labels_path = Path(active_graph_path).parent / ".graphify_labels.json"
@@ -3452,9 +3487,9 @@ def _build_server(graph_path: str):
                 return report_path.read_text(encoding="utf-8")
             return "GRAPH_REPORT.md not found. Run graphify extract first."
         if uri_str == "graphify://stats":
-            return _tool_graph_stats({})
+            return _tool_graph_stats(_ctx(), {})
         if uri_str == "graphify://god-nodes":
-            return _tool_god_nodes({"top_n": 10})
+            return _tool_god_nodes(_ctx(), {"top_n": 10})
         if uri_str == "graphify://surprises":
             try:
                 from graphify.analyze import surprising_connections
@@ -3502,7 +3537,7 @@ def _build_server(graph_path: str):
             return [types.TextContent(type="text", text=f"Unknown tool: {name}")]
         try:
             _select_graph(project_path)  # bind G/communities to the target graph
-            return [types.TextContent(type="text", text=handler(arguments))]
+            return [types.TextContent(type="text", text=handler(_ctx(), arguments))]
         except ToolError:
             # A handler-signalled error: propagate so the result is marked
             # isError:true (the mcp 1.x decorator wraps a raised exception into
